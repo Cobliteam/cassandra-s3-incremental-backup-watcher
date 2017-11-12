@@ -111,9 +111,6 @@ def main():
     host_id = node_info['ID']
     data_center = node_info['Data Center']
 
-    host_id = 'ed76c4a4-c7d1-11e7-8ff8-9cb6d0d1faaf'
-    data_center = 'test1'
-
     keyspace_filter = check_includes_excludes(
         args.keyspaces, args.excluded_keyspaces)
     table_filter = check_includes_excludes(
