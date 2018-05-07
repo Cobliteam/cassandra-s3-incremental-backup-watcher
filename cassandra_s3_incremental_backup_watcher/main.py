@@ -7,12 +7,15 @@ import os
 import re
 import shlex
 import subprocess
+import sys
+import time
 
 import boto3
 
 from .util import clean_s3_path
 from .sstable import traverse_data_dir
-from .transfer import generate_transfers
+from .transfer import TransferManager
+from .watcher import Watcher
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +31,7 @@ def get_node_info(nodetool_cmd):
     data = {}
 
     for line in out.splitlines():
+        line = line.decode('utf-8')
         match = re.match(r'^([^:]+?)\s+:\s+(.+)\s*$', line)
         if not match:
             continue
@@ -51,7 +55,28 @@ def check_includes_excludes(includes, excludes):
     return check
 
 
+def chunked(iterable, n):
+    iterator = iter(iterable)
+
+    while True:
+        chunk = []
+        try:
+            while len(chunk) < n:
+                chunk.append(next(iterator))
+        except StopIteration:
+            yield chunk
+            return
+
+        yield chunk
+
+
 def main():
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger('watchdog').setLevel(logging.WARN)
+    logging.getLogger('boto3').setLevel(logging.WARN)
+    logging.getLogger('botocore').setLevel(logging.WARN)
+    logging.getLogger('s3transfer').setLevel(logging.WARN)
+
     argp = argparse.ArgumentParser()
     argp.add_argument(
         '--keyspace', action='append', dest='keyspaces', default=[],
@@ -90,11 +115,24 @@ def main():
         help='Storage class to apply to transferred files')
 
     argp.add_argument(
+        '--node-host-id', default=None, metavar='UUID',
+        help="Node ID to use when determining backup path. Leave empty"
+             "to autodetect using nodetool")
+    argp.add_argument(
+        '--node-datacenter', default=None, metavar='DC',
+        help="Datacenter to use when determining backup path. Leave empty"
+             "to autodetect using nodetool")
+
+    argp.add_argument(
         '--delete', default=False, action='store_true',
         help='Whether to delete transferred files after finishing. Files '
              'will only be deleted after all other files for the same SSTable '
              'have been successfully sent, to avoid leaving partial data '
              'behind')
+    argp.add_argument(
+        '--one-shot', default=False, action='store_true',
+        help='Run synchronization once instead of watching continuously for '
+             'new data')
     argp.add_argument(
         '--dry-run', default=False, action='store_true',
         help="Don't upload or delete any files, only print intended actions ")
@@ -104,28 +142,36 @@ def main():
 
     args = argp.parse_args()
 
-    # Run nodetool earlier than necessary, since it's much quicker to fail than
-    # traversing the data dir to find the SSTables
-    nodetool_cmd = shlex.split(os.environ.get('NODETOOL_CMD', 'nodetool'))
-    node_info = get_node_info(nodetool_cmd)
-    host_id = node_info['ID']
-    data_center = node_info['Data Center']
+    if args.node_host_id and args.node_datacenter:
+        logger.info('Using provided host ID and DC')
+        host_id = args.node_host_id
+        datacenter = args.node_datacenter
+    elif not args.node_host_id and not args.node_datacenter:
+        logger.info('Determining host ID and DC using nodetool')
+
+        # Run nodetool earlier than necessary, since it's much quicker to fail than
+        # traversing the data dir to find the SSTables
+        nodetool_cmd = shlex.split(os.environ.get('NODETOOL_CMD', 'nodetool'))
+        node_info = get_node_info(nodetool_cmd)
+        host_id = node_info['ID']
+        datacenter = node_info['Data Center']
+    else:
+        argp.error('Must provide both --node-host-id and --node-datacenter, '
+                   'or neither')
+        sys.exit(1)
+
+    logger.info('Host ID: %s, Datacenter: %s', host_id, datacenter)
 
     keyspace_filter = check_includes_excludes(
         args.keyspaces, args.excluded_keyspaces)
     table_filter = check_includes_excludes(
         args.tables, args.excluded_tables)
 
-    sstables = []
-    for data_dir in args.data_dirs:
-        sstables.extend(traverse_data_dir(data_dir, keyspace_filter,
-                                          table_filter))
-
     s3_client = boto3.client('s3')
-    s3_path = '{}/{}/{}'.format(clean_s3_path(args.s3_path), data_center,
+    s3_path = '{}/{}/{}'.format(clean_s3_path(args.s3_path), datacenter,
                                 host_id)
-    transfers = list(generate_transfers(s3_client, args.s3_bucket, s3_path,
-                                        sstables))
+
+    logger.info('Storing backups at s3://%s/%s', args.s3_bucket, s3_path)
 
     s3_settings = {
         'Metadata': args.s3_metadata,
@@ -133,6 +179,37 @@ def main():
         'StorageClass': args.s3_storage_class
     }
 
-    for transfer in transfers:
-        transfer.run(s3_client, s3_settings, delete=args.delete,
-                     dry_run=args.dry_run)
+    logger.debug('S3 settings: %s', s3_settings)
+
+    manager = TransferManager(
+        s3_client=s3_client, s3_bucket=args.s3_bucket, s3_path=s3_path,
+        s3_settings=s3_settings, delete=args.delete, dry_run=args.dry_run)
+
+    with manager:
+        logger.debug('Started TransferManager')
+
+        def schedule_one_shot():
+            logger.info('Scanning existing SSTables')
+            for data_dir in args.data_dirs:
+                sstable_iter = traverse_data_dir(data_dir, keyspace_filter,
+                                                 table_filter)
+                for sstables in chunked(sstable_iter, 200):
+                    manager.schedule(sstables)
+
+        if args.one_shot:
+            schedule_one_shot()
+            manager.close()
+        else:
+            # Make sure to start the watcher before queueing the transfer of
+            # existing SSTables. Otherwise some tables could be missed if they
+            # are created after the initial transfers have started, but the
+            # Watcher is not running yet.
+            watcher = Watcher(
+                transfer_manager=manager, data_dirs=args.data_dirs,
+                keyspace_filter=keyspace_filter, table_filter=table_filter)
+            with watcher:
+                logging.info('Watching SSTables')
+                schedule_one_shot()
+
+                while True:
+                    time.sleep(1)
