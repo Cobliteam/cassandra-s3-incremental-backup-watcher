@@ -2,170 +2,162 @@ from __future__ import absolute_import, unicode_literals
 
 import logging
 import os.path
-import sys
-import time
-from functools import partial
-from threading import Timer, RLock
+from collections import defaultdict, namedtuple
+from concurrent.futures import Future
+from _thread import interrupt_main
+
+from s3transfer.exceptions import CancelledError
+from s3transfer.manager import TransferConfig, \
+                               TransferManager as S3TransferManager
+from s3transfer.subscribers import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-
-class BandwidthMeter(object):
-    def __init__(self, half_life=0.5):
-        self.half_life = half_life
-
-        self._last_update = None
-        self._average_bandwidth = 0
-        self._total_units = 0
-
-    def average_bandwidth(self):
-        return self._average_bandwidth
-
-    def total_units(self):
-        return self._total_units
-
-    def update(self, units_transmitted, new_time):
-        if self._last_update:
-            time_diff = max(new_time - self._last_update, 10e-6)
-
-            # Use an exponentially weighted moving average to show upload speed
-            # The half-life determines how long until an observation loses half
-            # of it's impact in the current average. This approach is copied
-            # from Riemann:
-            # https://github.com/riemann/riemann/blob/0.2.14/src/riemann/streams.clj#L952
-
-            old_weight = 0.5 ** (time_diff / self.half_life)
-            new_weight = 1 - old_weight
-
-            old_avg = self._average_bandwidth
-            new_avg = units_transmitted / time_diff
-            cur_avg = (old_avg * old_weight) + (new_avg * new_weight)
-
-            self._average_bandwidth = cur_avg
-
-        self._last_update = new_time
-        self._total_units += units_transmitted
+SSTableTransfer = namedtuple('SSTableTransfer',
+                             'sstable bucket dest_paths total_size')
 
 
-class SSTableTransfer(object):
-    def __init__(self, sstable, bucket, dest_paths, total_size):
-        self.sstable = sstable
-        self.bucket = bucket
-        self.dest_paths = dest_paths
-        self.total_size_bytes = total_size
+class TransferManager(BaseSubscriber):
+    def __init__(self, s3_client, s3_bucket, s3_path, s3_settings,
+                 delete=False, dry_run=True, s3_config=None):
+        self.s3_client = s3_client
+        self.s3_bucket = s3_bucket
+        self.s3_path = s3_path
+        self.s3_settings = s3_settings
+        self.s3_config = s3_config and TransferConfig(**s3_config)
+        self.delete = delete
+        self.dry_run = dry_run
 
-        self.progress_lock = RLock()
-        self.progress_timer = None
-        self.progress_meter = BandwidthMeter()
-        self.cur_filename = None
+        self._pending_transfers = defaultdict(set)
+        self._failed_transfers = defaultdict(set)
+        self._closed = False
+        self._finished = Future()
 
-    def progress_callback(self, filename, bytes_written):
-        with self.progress_lock:
-            self.progress_meter.update(bytes_written, time.time())
+    def _list_objects(self, Prefix=None, **kwargs):
+        if Prefix is None:
+            Prefix = self.s3_path
+        else:
+            Prefix = '{}/{}'.format(self.s3_path, Prefix)
 
-            old_fname, self.cur_filename = self.cur_filename, filename
-            if old_fname != filename:
-                # Always update the progress if a new transfer has started
-                self.print_progress()
+        paginate = self.s3_client.get_paginator('list_objects_v2').paginate
+        return paginate(Bucket=self.s3_bucket, Prefix=Prefix, **kwargs)
 
-    def print_progress(self):
-        with self.progress_lock:
-            # Cancel the current timer, as we might have been triggered by a
-            # forced update instead of the timer.
-            if self.progress_timer:
-                self.progress_timer.cancel()
-
-            percentage = (self.progress_meter.total_units() * 100.0 /
-                          self.total_size_bytes)
-
-            left_part = '{}/{}/{}'.format(
-                self.sstable.keyspace, self.sstable.table, self.cur_filename)
-            right_part = '{:.02f}% ({:.02f} KiB/s)'.format(
-                percentage, self.progress_meter.average_bandwidth() / 1024.0)
-
-            # We could determine the current terminal width, but that would
-            # require an external library or some annoying fnctl stuff.
-            num_spaces = max(80 - len(left_part) - len(right_part), 1)
-            spaces = ' ' * num_spaces
-
-            sys.stderr.write('\r' + left_part + spaces + right_part)
-            sys.stderr.flush()
-
-            self.progress_timer = Timer(1.0, self.print_progress)
-            self.progress_timer.start()
-
-    def run(self, s3_client, s3_settings, delete=False, dry_run=True):
-        try:
-            for sstable_file, dest_path in zip(self.sstable.files,
-                                               self.dest_paths):
-                # Files that are already present in the destination should be
-                # skipped (they have a dest_path of None)
-                if not dest_path:
-                    continue
-
-                full_path = os.path.join(self.sstable.local_dir,
-                                         sstable_file.filename)
-                full_path = os.path.abspath(full_path)
-
-                if dry_run:
-                    verb = 'Uploaded (dry-run)'
-                else:
-                    verb = 'Uploaded'
-                    progress_callback = None
-
-                    if sys.stderr.isatty():
-                        progress_callback = partial(self.progress_callback,
-                                                    sstable_file.filename)
-
-                    s3_client.upload_file(full_path, self.bucket, dest_path,
-                                          ExtraArgs=s3_settings,
-                                          Callback=progress_callback)
-
-                    # Break after the last progress line, as we usually erase it
-                    # and never print the newline.
-                    if sys.stderr.isatty():
-                        sys.stderr.write('\n')
-                        sys.stderr.flush()
-
-                sys.stdout.write('{} {}\n'.format(verb, dest_path))
-                sys.stdout.flush()
-        finally:
-            with self.progress_lock:
-                if self.progress_timer:
-                    self.progress_timer.cancel()
-                    self.progress_timer = None
-
-        # Delete all files at once after all transfers complete, to avoid
-        # keeping partial SSTables
-        if delete:
-            self.sstable.delete_files(dry_run)
-
-
-def generate_transfers(s3_client, s3_bucket, s3_path, sstables):
-    paginator = s3_client.get_paginator('list_objects_v2')
-
-    # Grabbing all objects, even if the bucket has lots of files, is much
-    # faster than doing one roundtrip per-SSTable with a prefix search.
-    existing_objects = {}
-    for response in paginator.paginate(Bucket=s3_bucket, Prefix=s3_path):
-        for item in response.get('Contents', []):
-            existing_objects[item['Key']] = item['Size']
-
-    for sstable in sstables:
-        storage_path = sstable.storage_path(s3_path)
-        dest_paths = []
-        total_size = 0
+    def _sstable_paths(self, sstable):
+        storage_path = sstable.storage_path(self.s3_path)
 
         for sstable_file in sstable.files:
+            src_path = os.path.join(sstable.local_dir,
+                                    sstable_file.filename)
             dest_path = storage_path + '/' + sstable_file.filename
-            existing_size = existing_objects.get(dest_path)
+            yield sstable_file, src_path, dest_path
 
-            if existing_size == sstable_file.size:
-                logger.debug('Skipping matching Remote SSTable: %s', dest_path)
-                dest_path = None
-            else:
-                total_size += sstable_file.size
+    def _prepare_upload(self, sstable, src_path, dest_path):
+        self._pending_transfers[sstable].add(dest_path)
 
-            dest_paths.append(dest_path)
+    def _upload(self, sstable, src_path, dest_path):
+        logger.debug('Starting transfer: %s => %s', src_path, dest_path)
 
-        yield SSTableTransfer(sstable, s3_bucket, dest_paths, total_size)
+        transfer = self._s3_manager.upload(
+            src_path, self.s3_bucket, dest_path, extra_args=self.s3_settings,
+            subscribers=[self])
+        transfer.meta.user_context['sstable'] = sstable
+        return transfer
+
+    def _finish_upload(self, sstable, dest_path, failed=False):
+        if self.dry_run:
+            print('Sent (dry-run): {}'.format(dest_path))
+        else:
+            print('Sent: {}'.format(dest_path))
+
+        sstable_pending = self._pending_transfers[sstable]
+        sstable_failed = self._failed_transfers[sstable]
+
+        sstable_pending.remove(dest_path)
+        if failed:
+            sstable_failed.add(dest_path)
+
+        if not sstable_pending:
+            logger.debug('Finished uploading SSTable: %s', sstable)
+
+            if not sstable_failed:
+                sstable.delete_files(dry_run=self.dry_run)
+
+            del self._pending_transfers[sstable]
+
+        if self._closed and not self._pending_transfers:
+            self._finished.set_result(None)
+
+    def schedule(self, sstables, check_remote=True):
+        if self._closed:
+            raise RuntimeError('Scheduling is closed')
+
+        existing_objects = {}
+        if check_remote:
+            for response in self._list_objects():
+                for item in response.get('Contents', []):
+                    existing_objects[item['Key']] = item['Size']
+
+        # Aggregate all the transfers that will be made to ensure a transfer
+        # starting and ending quickly won't falsely trigger the finishing
+        # logic by seemingly being the only one.
+        for sstable in sstables:
+            for _, src_path, dest_path in self._sstable_paths(sstable):
+                self._prepare_upload(sstable, src_path, dest_path)
+
+        # Start actual uploads
+        for sstable in sstables:
+            for sstable_file, src_path, dest_path in \
+                    self._sstable_paths(sstable):
+                # This will always be None if check_remote is disabled.
+                existing_size = existing_objects.get(dest_path)
+                if existing_size == sstable_file.size:
+                    logger.debug('Skipping matching remote SSTable: %s',
+                                 dest_path)
+                    self._finish_upload(sstable, dest_path)
+                    continue
+
+                self._upload(sstable, src_path, dest_path)
+
+    def on_done(self, future, **kwargs):
+        sstable = future.meta.user_context['sstable']
+        dest_path = future.meta.call_args.key
+
+        try:
+            future.result()
+        except (KeyboardInterrupt, CancelledError):
+            print('Cancelled: {}'.format(dest_path))
+            self.close()
+            self._finish_upload(sstable, dest_path, failed=True)
+
+            interrupt_main()
+        except Exception as e:
+            print('Failed: {}: {}'.format(dest_path, e))
+            self._finish_upload(sstable, dest_path, failed=True)
+        else:
+            self._finish_upload(sstable, dest_path)
+
+    def close(self):
+        self._closed = True
+
+        if not self._pending_transfers and not self._finished.done():
+            self._finished.set_result(None)
+
+    def __enter__(self):
+        self._s3_manager = S3TransferManager(self.s3_client,
+                                             config=self.s3_config)
+        self._s3_manager.__enter__()
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._closed = True
+
+        try:
+            self._s3_manager.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._s3_manager = None
+
+        if not exc_val:
+            self._finished.result()
+        else:
+            self._finished.cancel()
