@@ -1,7 +1,8 @@
 pytest
 pytest-cov
+fallocate
+moto
 flake8
 tox
 bumpversion
 twine
-fallocate

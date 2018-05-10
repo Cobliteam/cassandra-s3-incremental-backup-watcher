@@ -21,13 +21,12 @@ logger = logging.getLogger(__name__)
 
 class Runner(object):
     def __init__(self, args):
-        self.parse_filters()
-        self.parse_s3_options()
-        self.parse_node_info()
+        self.parse_filters(args)
+        self.parse_node_info(args)
+        self.parse_s3_options(args)
+        self.parse_misc(args)
 
-        self.delete = args.delete
-        self.dry_run = args.dry_run
-        self.data_dirs = args.data_dirs
+        self._s3_client = None
 
     def get_node_info_from_nodetool(self, cmd):
         cmd = list(cmd) + ['info']
@@ -71,8 +70,11 @@ class Runner(object):
         logger.info('Host ID: %s', host_id)
         logger.info('Datacenter: %s', datacenter)
 
-    def get_s3_client(self):
-        return boto3.client('s3')
+    @property
+    def s3_client(self):
+        if self._s3_client is None:
+            self._s3_client = boto3.client('s3')
+        return self._s3_client
 
     def parse_s3_options(self, args):
         self.s3_bucket = args.s3_bucket
@@ -107,9 +109,14 @@ class Runner(object):
         self.table_filter = self._gen_filter(
             args.tables, args.excluded_tables)
 
+    def parse_misc(self, args):
+        self.delete = args.delete
+        self.dry_run = args.dry_run
+        self.data_dirs = args.data_dirs
+
     def get_manager(self):
         return TransferManager(
-            s3_client=self.get_s3_client(), s3_bucket=self.s3_bucket,
+            s3_client=self.s3_client, s3_bucket=self.s3_bucket,
             s3_path=self.s3_path, s3_settings=self.s3_settings,
             delete=self.delete, dry_run=self.dry_run)
 
@@ -119,7 +126,7 @@ class Runner(object):
             keyspace_filter=self.keyspace_filter,
             table_filter=self.table_filter)
 
-    def _schedule_one_shot_uploads(self, batch_size=1000):
+    def _schedule_one_shot_uploads(self, manager, batch_size=1000):
         logger.info('Synchronizing existing SSTables')
 
         # Make the uploads in batches to avoid having to traverse all the data
@@ -133,7 +140,7 @@ class Runner(object):
 
         def schedule_batch():
             if batch:
-                self.manager.schedule(batch)
+                manager.schedule(batch)
                 batch[:] = []
 
         for data_dir in self.data_dirs:
@@ -153,7 +160,7 @@ class Runner(object):
 
     def run_one_shot(self):
         with self.get_manager() as manager:
-            self._schedule_one_shot_uploads()
+            self._schedule_one_shot_uploads(manager)
             manager.close()
             manager.join()
 
@@ -166,7 +173,7 @@ class Runner(object):
             with self.get_watcher():
                 logging.info('Watching SSTables')
 
-                self._schedule_one_shot_uploads()
+                self._schedule_one_shot_uploads(manager)
                 manager.join()
 
 

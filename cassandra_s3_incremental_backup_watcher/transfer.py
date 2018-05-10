@@ -2,11 +2,13 @@ import logging
 import os.path
 import sys
 from collections import defaultdict, namedtuple
-from concurrent.futures import CancelledError, Future
+from concurrent.futures import CancelledError
+from threading import Event, Lock
 
 from s3transfer.manager import TransferConfig, \
                                TransferManager as S3TransferManager
 from s3transfer.subscribers import BaseSubscriber
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +35,11 @@ class TransferManager(BaseSubscriber):
         self.delete = delete
         self.dry_run = dry_run
 
-        self._pending_transfers = defaultdict(set)
-        self._failed_transfers = defaultdict(set)
+        self._pending_transfers = {}
+        self._failed_transfers = {}
         self._closed = False
-        self._finished = Future()
+        self._state_lock = Lock()
+        self._finished = Event()
 
     def _list_objects(self, Prefix=None, **kwargs):
         if Prefix is None:
@@ -55,40 +58,68 @@ class TransferManager(BaseSubscriber):
             yield sstable_file, src_path, dest_path
 
     def _prepare_upload(self, sstable, src_path, dest_path):
-        self._pending_transfers[sstable].add(dest_path)
+        logger.debug('prepare %s', dest_path)
+
+        with self._state_lock:
+            try:
+                pending = self._pending_transfers[sstable]
+                pending.add(dest_path)
+            except KeyError:
+                self._pending_transfers[sstable] = set([dest_path])
+                self._failed_transfers[sstable] = set()
 
     def _upload(self, sstable, src_path, dest_path):
+        logger.debug('start %s', dest_path)
+
         logger.debug('Sending: %s => %s', src_path, dest_path)
 
         transfer = self._s3_manager.upload(
             src_path, self.s3_bucket, dest_path, extra_args=self.s3_settings,
             subscribers=[self])
+        print('created %s', str(id(transfer)))
         transfer.meta.user_context['sstable'] = sstable
         return transfer
 
-    def _finish_upload(self, sstable, dest_path, failed=False):
-        if self.dry_run:
+    def _check_finished(self):
+        logger.debug('_check_finished %s', self._pending_transfers)
+        if self._closed and not self._pending_transfers:
+            self._finished.set()
+
+    def _finish_upload(self, sstable, dest_path, exception=None,
+                       cancelled=False):
+        if exception is not None:
+            if cancelled:
+                sys.stdout.write('Cancelled: {}\n'.format(dest_path))
+            else:
+                sys.stdout.write(
+                    'Failed: {}: {}\n'.format(dest_path, exception))
+        elif self.dry_run:
             sys.stdout.write('Sent (dry-run): {}\n'.format(dest_path))
         else:
             sys.stdout.write('Sent: {}\n'.format(dest_path))
 
-        sstable_pending = self._pending_transfers[sstable]
-        sstable_failed = self._failed_transfers[sstable]
+        try:
+            with self._state_lock:
+                logger.debug('done %s', dest_path)
 
-        sstable_pending.remove(dest_path)
-        if failed:
-            sstable_failed.add(dest_path)
+                sstable_pending = self._pending_transfers[sstable]
+                sstable_failed = self._failed_transfers[sstable]
 
-        if not sstable_pending:
-            logger.debug('Finished uploading SSTable: %s', sstable)
+                sstable_pending.remove(dest_path)
+                if exception is not None:
+                    sstable_failed.add(dest_path)
 
-            if self.delete and not sstable_failed:
-                sstable.delete_files(dry_run=self.dry_run)
+                if not sstable_pending:
+                    logger.debug('Finished uploading SSTable: %s', sstable)
 
-            del self._pending_transfers[sstable]
+                    if self.delete and not sstable_failed:
+                        sstable.delete_files(dry_run=self.dry_run)
 
-        if self._closed and not self._pending_transfers:
-            self._finished.set_result(None)
+                    del self._pending_transfers[sstable]
+                    self._check_finished()
+        except:
+            logger.exception()
+            raise
 
     def schedule(self, sstables):
         if self._closed:
@@ -121,6 +152,7 @@ class TransferManager(BaseSubscriber):
                     self._sstable_paths(sstable):
                 existing_size = existing_objects.get(dest_path)
                 if existing_size == sstable_file.size:
+                    logger.debug('skip %s', dest_path)
                     logger.debug('Skipping matching remote SSTable: %s',
 
                                  dest_path)
@@ -133,36 +165,34 @@ class TransferManager(BaseSubscriber):
         sstable = future.meta.user_context['sstable']
         dest_path = future.meta.call_args.key
 
+        print('finished', str(id(future)), dest_path)
+
         try:
-            future.result()
-        except (KeyboardInterrupt, CancelledError):
-            sys.stdout.write('Cancelled: {}\n'.format(dest_path))
-            self._finish_upload(sstable, dest_path, failed=True)
-            self.shutdown(cancel=True)
-        except Exception as e:
-            sys.stdout.write('Failed: {}: {}\n'.format(dest_path, e))
-            self._finish_upload(sstable, dest_path, failed=True)
-        else:
-            self._finish_upload(sstable, dest_path)
+            try:
+                future.result()
+            except (KeyboardInterrupt, CancelledError) as e:
+                self._finish_upload(sstable, dest_path, exception=e,
+                                    cancelled=True)
+                self.shutdown(cancel=True)
+                raise
+            except Exception as e:
+                self._finish_upload(sstable, dest_path, exception=e)
+                raise
+            else:
+                self._finish_upload(sstable, dest_path)
+        except Exception:
+            logger.debug('on_done', exc_info=True)
 
     def close(self):
         self._closed = True
-
-        if not self._pending_transfers and not self._finished.done():
-            self._finished.set_result(None)
+        self._check_finished()
 
     def join(self):
-        try:
-            self._finished.result()
-        except CancelledError:
-            self._finished.cancel()
-            raise
+        while not self._finished.wait(10):
+            logger.debug('waiting %s', self._pending_transfers.values())
 
     def shutdown(self, cancel=False):
         self._closed = True
-
-        if not self._finished.done():
-            self._finished.cancel()
 
         if self._s3_manager:
             self._s3_manager.shutdown(cancel=cancel)
