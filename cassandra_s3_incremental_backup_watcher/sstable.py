@@ -36,24 +36,30 @@ class SSTable(namedtuple('SSTable', 'keyspace table name local_dir files')):
 SSTableFile = namedtuple('SSTableFile', 'filename size')
 
 
+def find_sstable_from_data(data_file, keyspace_name, table_name):
+    logger.debug("Found SSTable data file: %s", data_file)
+
+    # Use the Data file as pivot to find all the other files. It's hard to
+    # tell if any other components are guaranteed to exist, so we just
+    # assume the Data is.
+    sstable_name = re.sub(r'-Data\.db$', '', os.path.basename(data_file))
+    sstable_dir = os.path.dirname(data_file)
+    sstable_paths = glob.glob(
+        os.path.join(sstable_dir, sstable_name + '-*.*'))
+
+    sstable_files = []
+    for sstable_path in sstable_paths:
+        # logger.debug("Found SSTable file: %s", sstable_path)
+        sstable_files.append(SSTableFile(os.path.basename(sstable_path),
+                                         os.path.getsize(sstable_path)))
+
+    return SSTable(keyspace_name, table_name, sstable_name, sstable_dir,
+                   tuple(sstable_files))
+
+
 def traverse_backups_dir(path, keyspace_name, table_name):
     for data_file in glob.glob(os.path.join(path, '*-Data.db')):
-        logger.debug("Found SSTable data file: %s", data_file)
-
-        # Use the Data file as pivot to find all the other files. It's hard to
-        # tell if any other components are guaranteed to exist, so we just
-        # assume the Data is.
-        sstable_name = re.sub(r'-Data\.db$', '', os.path.basename(data_file))
-        sstable_paths = glob.glob(os.path.join(path, sstable_name + '-*.*'))
-
-        sstable_files = []
-        for sstable_path in sstable_paths:
-            logger.debug("Found SSTable file: %s", sstable_path)
-            sstable_files.append(SSTableFile(os.path.basename(sstable_path),
-                                             os.path.getsize(sstable_path)))
-
-        yield SSTable(keyspace_name, table_name, sstable_name, path,
-                      sstable_files)
+        yield find_sstable_from_data(data_file, keyspace_name, table_name)
 
 
 def traverse_keyspace_dir(path, keyspace_name, table_filter=None):
