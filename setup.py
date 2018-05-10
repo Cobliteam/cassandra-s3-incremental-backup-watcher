@@ -15,7 +15,6 @@ setup(
     license='MIT',
     install_requires=[
         'boto3',
-        'future',
         'watchdog'
     ],
     entry_points={
