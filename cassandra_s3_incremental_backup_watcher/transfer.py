@@ -2,11 +2,10 @@ from __future__ import absolute_import, unicode_literals
 
 import logging
 import os.path
+import sys
 from collections import defaultdict, namedtuple
-from concurrent.futures import Future
-from _thread import interrupt_main
+from concurrent.futures import CancelledError, Future
 
-from s3transfer.exceptions import CancelledError
 from s3transfer.manager import TransferConfig, \
                                TransferManager as S3TransferManager
 from s3transfer.subscribers import BaseSubscriber
@@ -125,13 +124,11 @@ class TransferManager(BaseSubscriber):
         try:
             future.result()
         except (KeyboardInterrupt, CancelledError):
-            print('Cancelled: {}'.format(dest_path))
-            self.close()
+            sys.stdout.write('Cancelled: {}\n'.format(dest_path))
             self._finish_upload(sstable, dest_path, failed=True)
-
-            interrupt_main()
+            self.shutdown(cancel=True)
         except Exception as e:
-            print('Failed: {}: {}'.format(dest_path, e))
+            sys.stdout.write('Failed: {}: {}\n'.format(dest_path, e))
             self._finish_upload(sstable, dest_path, failed=True)
         else:
             self._finish_upload(sstable, dest_path)
@@ -142,22 +139,28 @@ class TransferManager(BaseSubscriber):
         if not self._pending_transfers and not self._finished.done():
             self._finished.set_result(None)
 
+    def join(self):
+        try:
+            self._finished.result()
+        except CancelledError:
+            self._finished.cancel()
+            raise
+
+    def shutdown(self, cancel=False):
+        self._closed = True
+
+        if not self._finished.done():
+            self._finished.cancel()
+
+        if self._s3_manager:
+            self._s3_manager.shutdown(cancel=cancel)
+            self._s3_manager = None
+
     def __enter__(self):
         self._s3_manager = S3TransferManager(self.s3_client,
                                              config=self.s3_config)
-        self._s3_manager.__enter__()
-
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._closed = True
-
-        try:
-            self._s3_manager.__exit__(exc_type, exc_val, exc_tb)
-        finally:
-            self._s3_manager = None
-
-        if not exc_val:
-            self._finished.result()
-        else:
-            self._finished.cancel()
+        cancel = exc_val is not None
+        self.shutdown(cancel=cancel)
