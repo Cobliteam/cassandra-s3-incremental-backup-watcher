@@ -1,6 +1,10 @@
 import logging
 import os
 import shutil
+import socket
+import subprocess
+import tempfile
+import time
 import uuid
 from contextlib import ExitStack
 from random import getrandbits
@@ -83,19 +87,21 @@ class SSTableGenerator(object):
 
 
 class TestRunner(Runner):
-    def __init__(self, data_dirs, delete=False, dry_run=True):
+    def __init__(self, data_dirs, s3_resource, s3_bucket, delete=False,
+                 dry_run=True):
         super(TestRunner, self).__init__(None)
 
         self.delete = delete
         self.dry_run = dry_run
         self.data_dirs = data_dirs
+        self.s3_bucket = s3_bucket
+        self._s3_resource = s3_resource
 
     def parse_node_info(self, args):
         self.datacenter = 'datacenter1'
         self.host_id = str(uuid.uuid4())
 
     def parse_s3_options(self, args):
-        self.s3_bucket = 'test'
         self.s3_path = '{}/{}/{}'.format('test', self.datacenter, self.host_id)
         self.s3_settings = {}
 
@@ -105,25 +111,6 @@ class TestRunner(Runner):
 
     def parse_misc(self, args):
         pass
-
-    @property
-    def s3_client(self):
-        return boto3.client(
-            's3', region_name='us-east-1',
-            aws_access_key_id='WEBSCGVPTHKQ0BH6B62L', aws_secret_access_key='gft5dPKqmvGG1MQsKhiyqNG8GCT7MSl64v9/k22d',
-            endpoint_url='http://127.0.0.1:9000/')
-
-
-@pytest.fixture
-def s3_res():
-    endpoint = os.environ.get('AWS_S3_ENDPOINT_URL')
-    res = boto3.resource('s3', endpoint_url=endpoint)
-    yield res
-
-
-@pytest.fixture
-def s3_client(s3_res):
-    return s3_res.client
 
 
 @pytest.fixture
@@ -137,21 +124,82 @@ def tables():
 
 
 @pytest.fixture
-def sstable_generators(tmpdir, keyspaces, tables):
-    with ExitStack() as stack:
-        gens = [stack.enter_context(SSTableGenerator(
-                    str(tmpdir), keyspace, table, size=100))
-                for keyspace in keyspaces
-                for table in tables]
-        yield gens
+def sstable_dir(tmpdir):
+    return tmpdir.mkdir('sstables')
 
 
 @pytest.fixture
-def sstables(sstable_generators):
-    sstables = []
+def sstables(sstable_dir, keyspaces, tables):
+    with ExitStack() as stack:
+        sstables = []
+        for keyspace in keyspaces:
+            for table in tables:
+                gen = stack.enter_context(
+                    SSTableGenerator(str(sstable_dir), keyspace, table, size=100))
+                gen.generate(5)
+                sstables.extend(gen.sstables)
 
-    for gen in sstable_generators:
-        gen.generate(2)
-        sstables.extend(gen.sstables)
+        yield sstables
 
-    return sstables
+
+def wait_for_port(host, port, timeout=10):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            sock = socket.create_connection((host, port), 1)
+            sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+        except socket.error:
+            continue
+        else:
+            return
+
+    raise socket.timeout('Waiting for {}:{}'.format(host, port))
+
+
+@pytest.fixture(scope='session')
+def s3_endpoint():
+    access_key = 'test'
+    secret_key = 'test1234'
+
+    minio_data_dir = tempfile.mkdtemp()
+    try:
+        minio_env = os.environ.copy()
+        minio_env.update({'MINIO_ACCESS_KEY': access_key,
+                          'MINIO_SECRET_KEY': secret_key})
+
+        proc = subprocess.Popen(
+            ['minio', 'server', str(minio_data_dir)], env=minio_env)
+        try:
+            wait_for_port('127.0.0.1', 9000)
+
+            os.environ['AWS_ACCESS_KEY_ID'] = access_key
+            os.environ['AWS_SECRET_ACCESS_KEY'] = secret_key
+            yield 'http://127.0.0.1:9000/'
+        finally:
+            proc.terminate()
+            proc.wait()
+    finally:
+        shutil.rmtree(minio_data_dir)
+
+
+@pytest.fixture
+def s3_resource(s3_endpoint):
+    return boto3.resource('s3', endpoint_url=s3_endpoint)
+
+
+@pytest.fixture
+def s3_bucket(s3_resource):
+    bucket_name = '{:x}'.format(getrandbits(8 * 8))
+    bucket = s3_resource.create_bucket(Bucket=bucket_name)
+    yield bucket
+
+
+@pytest.fixture
+def make_runner(sstable_dir, s3_resource, s3_bucket):
+    def make_runner(**kwargs):
+        return TestRunner(data_dirs=[str(sstable_dir)],
+                          s3_resource=s3_resource,
+                          s3_bucket=s3_bucket.name, **kwargs)
+
+    return make_runner

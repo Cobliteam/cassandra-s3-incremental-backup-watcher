@@ -1,7 +1,7 @@
 import logging
 import os.path
 import sys
-from collections import defaultdict, namedtuple
+from collections import namedtuple
 from concurrent.futures import CancelledError
 from threading import Event, Lock
 
@@ -76,7 +76,6 @@ class TransferManager(BaseSubscriber):
         transfer = self._s3_manager.upload(
             src_path, self.s3_bucket, dest_path, extra_args=self.s3_settings,
             subscribers=[self])
-        print('created %s', str(id(transfer)))
         transfer.meta.user_context['sstable'] = sstable
         return transfer
 
@@ -150,11 +149,13 @@ class TransferManager(BaseSubscriber):
         for sstable in sstables:
             for sstable_file, src_path, dest_path in \
                     self._sstable_paths(sstable):
+                if self.dry_run:
+                    self._finish_upload(sstable, dest_path)
+                    continue
+
                 existing_size = existing_objects.get(dest_path)
                 if existing_size == sstable_file.size:
-                    logger.debug('skip %s', dest_path)
                     logger.debug('Skipping matching remote SSTable: %s',
-
                                  dest_path)
                     self._finish_upload(sstable, dest_path)
                     continue
@@ -164,8 +165,6 @@ class TransferManager(BaseSubscriber):
     def on_done(self, future, **kwargs):
         sstable = future.meta.user_context['sstable']
         dest_path = future.meta.call_args.key
-
-        print('finished', str(id(future)), dest_path)
 
         try:
             try:

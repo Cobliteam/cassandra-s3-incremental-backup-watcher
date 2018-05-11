@@ -1,5 +1,3 @@
-from __future__ import absolute_import, unicode_literals
-
 import argparse
 import json
 import logging
@@ -70,11 +68,19 @@ class Runner(object):
         logger.info('Host ID: %s', host_id)
         logger.info('Datacenter: %s', datacenter)
 
+    def _get_s3_resource(self):
+        endpoint_url = os.environ.get('S3_ENDPOINT_URL')
+        return boto3.resource('s3', endpoint_url=endpoint_url)
+
+    @property
+    def s3_resource(self):
+        if self._s3_resource is None:
+            self._s3_resource = self._get_s3_resource()
+        return self._s3_resource
+
     @property
     def s3_client(self):
-        if self._s3_client is None:
-            self._s3_client = boto3.client('s3')
-        return self._s3_client
+        return self.s3_resource.meta.client
 
     def parse_s3_options(self, args):
         self.s3_bucket = args.s3_bucket
