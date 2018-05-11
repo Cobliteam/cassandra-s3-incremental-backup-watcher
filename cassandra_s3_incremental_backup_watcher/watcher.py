@@ -4,7 +4,7 @@ import logging
 import re
 
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, LoggingEventHandler
+from watchdog.events import FileSystemEventHandler
 
 from .sstable import find_sstable_from_data
 
@@ -49,7 +49,7 @@ class Watcher(FileSystemEventHandler):
         sstable = find_sstable_from_data(src_path, keyspace, table)
 
         logger.debug('Scheduling processing of SStable: %s', sstable)
-        self.transfer_manager.schedule([sstable], check_remote=False)
+        self.transfer_manager.schedule([sstable])
 
     def on_created(self, event):
         if not event.is_directory:

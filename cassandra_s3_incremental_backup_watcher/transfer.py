@@ -1,5 +1,3 @@
-from __future__ import absolute_import, unicode_literals
-
 import logging
 import os.path
 import sys
@@ -14,6 +12,14 @@ logger = logging.getLogger(__name__)
 
 SSTableTransfer = namedtuple('SSTableTransfer',
                              'sstable bucket dest_paths total_size')
+
+
+def common_prefix(a, b):
+    i = 0
+    for i in range(min(len(a), len(b))):
+        if a[i] != b[i]:
+            break
+    return a[:i + 1]
 
 
 class TransferManager(BaseSubscriber):
@@ -35,8 +41,6 @@ class TransferManager(BaseSubscriber):
     def _list_objects(self, Prefix=None, **kwargs):
         if Prefix is None:
             Prefix = self.s3_path
-        else:
-            Prefix = '{}/{}'.format(self.s3_path, Prefix)
 
         paginate = self.s3_client.get_paginator('list_objects_v2').paginate
         return paginate(Bucket=self.s3_bucket, Prefix=Prefix, **kwargs)
@@ -54,7 +58,7 @@ class TransferManager(BaseSubscriber):
         self._pending_transfers[sstable].add(dest_path)
 
     def _upload(self, sstable, src_path, dest_path):
-        logger.debug('Starting transfer: %s => %s', src_path, dest_path)
+        logger.debug('Sending: %s => %s', src_path, dest_path)
 
         transfer = self._s3_manager.upload(
             src_path, self.s3_bucket, dest_path, extra_args=self.s3_settings,
@@ -64,9 +68,9 @@ class TransferManager(BaseSubscriber):
 
     def _finish_upload(self, sstable, dest_path, failed=False):
         if self.dry_run:
-            print('Sent (dry-run): {}'.format(dest_path))
+            sys.stdout.write('Sent (dry-run): {}\n'.format(dest_path))
         else:
-            print('Sent: {}'.format(dest_path))
+            sys.stdout.write('Sent: {}\n'.format(dest_path))
 
         sstable_pending = self._pending_transfers[sstable]
         sstable_failed = self._failed_transfers[sstable]
@@ -78,7 +82,7 @@ class TransferManager(BaseSubscriber):
         if not sstable_pending:
             logger.debug('Finished uploading SSTable: %s', sstable)
 
-            if not sstable_failed:
+            if self.delete and not sstable_failed:
                 sstable.delete_files(dry_run=self.dry_run)
 
             del self._pending_transfers[sstable]
@@ -86,31 +90,39 @@ class TransferManager(BaseSubscriber):
         if self._closed and not self._pending_transfers:
             self._finished.set_result(None)
 
-    def schedule(self, sstables, check_remote=True):
+    def schedule(self, sstables):
         if self._closed:
             raise RuntimeError('Scheduling is closed')
-
-        existing_objects = {}
-        if check_remote:
-            for response in self._list_objects():
-                for item in response.get('Contents', []):
-                    existing_objects[item['Key']] = item['Size']
 
         # Aggregate all the transfers that will be made to ensure a transfer
         # starting and ending quickly won't falsely trigger the finishing
         # logic by seemingly being the only one.
+        # Also calculate the common prefix for the destination S3 paths so we
+        # can look for existing objects more efficiently.
+        prefix = None
         for sstable in sstables:
             for _, src_path, dest_path in self._sstable_paths(sstable):
+                if prefix is None:
+                    prefix = dest_path
+                else:
+                    prefix = common_prefix(prefix, dest_path)
+
                 self._prepare_upload(sstable, src_path, dest_path)
+
+        # Find existing objects to avoid repeated uploads
+        existing_objects = {}
+        for response in self._list_objects(Prefix=prefix):
+            for item in response.get('Contents', []):
+                existing_objects[item['Key']] = item['Size']
 
         # Start actual uploads
         for sstable in sstables:
             for sstable_file, src_path, dest_path in \
                     self._sstable_paths(sstable):
-                # This will always be None if check_remote is disabled.
                 existing_size = existing_objects.get(dest_path)
                 if existing_size == sstable_file.size:
                     logger.debug('Skipping matching remote SSTable: %s',
+
                                  dest_path)
                     self._finish_upload(sstable, dest_path)
                     continue
