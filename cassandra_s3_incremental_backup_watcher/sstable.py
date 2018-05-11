@@ -16,7 +16,7 @@ class SSTable(namedtuple('SSTable', 'keyspace table name local_dir files')):
     __slots__ = ()
 
     def delete_files(self, dry_run=True):
-        logger.debug("Deleting SSTable %s", self)
+        logger.debug("Deleting SSTable: %s", self)
 
         verb = 'Removed' if not dry_run else 'Removed (dry-run)'
 
@@ -24,7 +24,7 @@ class SSTable(namedtuple('SSTable', 'keyspace table name local_dir files')):
             path = os.path.join(self.local_dir, f.filename)
             if not dry_run:
                 os.remove(path)
-            sys.stdout.write('{} {}\n'.format(verb, path))
+            sys.stdout.write('{}: {}\n'.format(verb, path))
 
     def storage_path(self, base=''):
         if base:
