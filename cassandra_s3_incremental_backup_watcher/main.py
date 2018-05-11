@@ -7,8 +7,6 @@ import os
 import re
 import shlex
 import subprocess
-import sys
-import time
 
 import boto3
 
@@ -21,37 +19,162 @@ from .watcher import Watcher
 logger = logging.getLogger(__name__)
 
 
-def get_node_info(nodetool_cmd):
-    cmd = nodetool_cmd + ['info']
-    try:
-        out = subprocess.check_output(cmd)
-    except (subprocess.CalledProcessError, OSError) as e:
-        raise RuntimeError('nodetool failed: {}'.format(e))
+class Runner(object):
+    def __init__(self, args):
+        self.parse_filters()
+        self.parse_s3_options()
+        self.parse_node_info()
 
-    data = {}
+        self.delete = args.delete
+        self.dry_run = args.dry_run
+        self.data_dirs = args.data_dirs
 
-    for line in out.splitlines():
-        match = re.match(r'^([^:]+?)\s+:\s+(.+)\s*$', line)
-        if not match:
-            continue
+    def get_node_info_from_nodetool(self, cmd):
+        cmd = list(cmd) + ['info']
+        try:
+            out = subprocess.check_output(cmd)
+        except (subprocess.CalledProcessError, OSError) as e:
+            raise RuntimeError('nodetool failed: {}'.format(e))
 
-        key, value = match.group(1, 2)
-        data[key] = value
+        data = {}
+        for line in out.splitlines():
+            match = re.match(r'^([^:]+?)\s+:\s+(.+)\s*$', line)
+            if not match:
+                continue
 
-    return data
+            key, value = match.group(1, 2)
+            data[key] = value
+
+        return data
+
+    def parse_node_info(self, args):
+        if args.node_host_id and args.node_datacenter:
+            logger.info('Using provided host ID and DC')
+            host_id = args.node_host_id
+            datacenter = args.node_datacenter
+        elif not args.node_host_id and not args.node_datacenter:
+            logger.info('Determining host ID and DC using nodetool')
+
+            # Run nodetool earlier than necessary, since it's much quicker to fail than
+            # traversing the data dir to find the SSTables
+            nodetool_cmd = shlex.split(os.environ.get('NODETOOL_CMD', 'nodetool'))
+            node_info = self.get_node_info_from_nodetool(nodetool_cmd)
+            host_id = node_info['ID']
+            datacenter = node_info['Data Center']
+        else:
+            raise RuntimeError(
+                'Must provide both --node-host-id and --node-datacenter, or '
+                'neither')
+
+        self.host_id = host_id
+        self.datacenter = datacenter
+        logger.info('Host ID: %s', host_id)
+        logger.info('Datacenter: %s', datacenter)
+
+    def get_s3_client(self):
+        return boto3.client('s3')
+
+    def parse_s3_options(self, args):
+        self.s3_bucket = args.s3_bucket
+        self.s3_path = '{}/{}/{}'.format(clean_s3_path(args.s3_path),
+                                         self.datacenter, self.host_id)
+
+        logger.info('Storing backups at s3://%s/%s', self.s3_bucket,
+                    self.s3_path)
+
+        self.s3_settings = {
+            'Metadata': args.s3_metadata,
+            'ACL': args.s3_acl,
+            'StorageClass': args.s3_storage_class
+        }
+        logger.info('Using S3 settings: %s', self.s3_settings)
+
+    def _gen_filter(self, includes, excludes):
+        includes = frozenset(includes)
+        excludes = frozenset(excludes)
+
+        def check(value):
+            if includes and value not in includes:
+                return False
+
+            return value not in excludes
+
+        return check
+
+    def parse_filters(self, args):
+        self.keyspace_filter = self._gen_filter(
+            args.keyspaces, args.excluded_keyspaces)
+        self.table_filter = self._gen_filter(
+            args.tables, args.excluded_tables)
+
+    def get_manager(self):
+        return TransferManager(
+            s3_client=self.get_s3_client(), s3_bucket=self.s3_bucket,
+            s3_path=self.s3_path, s3_settings=self.s3_settings,
+            delete=self.delete, dry_run=self.dry_run)
+
+    def get_watcher(self, manager):
+        return Watcher(
+            transfer_manager=manager, data_dirs=self.data_dirs,
+            keyspace_filter=self.keyspace_filter,
+            table_filter=self.table_filter)
+
+    def _schedule_one_shot_uploads(self, batch_size=1000):
+        logger.info('Synchronizing existing SSTables')
+
+        # Make the uploads in batches to avoid having to traverse all the data
+        # directories before even starting to send something. Break and schedule
+        # the current batch if it reached the maximum size, or the keyspace
+        # or table has changed. This way we make the existing object search more
+        # efficient by ensuring the SSTables scheduled together have a large
+        # common path prefix (thus returning less wasted results).
+
+        batch = []
+
+        def schedule_batch():
+            if batch:
+                self.manager.schedule(batch)
+                batch[:] = []
+
+        for data_dir in self.data_dirs:
+            sstables = traverse_data_dir(data_dir, self.keyspace_filter,
+                                         self.table_filter)
+            ks_table = None
+            for sstable in sstables:
+                last_ks_table, ks_table,  = \
+                    ks_table, (sstable.keyspace, sstable.table)
+
+                if last_ks_table != ks_table or len(batch) == batch_size:
+                    schedule_batch()
+
+                batch.append(sstable)
+
+            schedule_batch()
+
+    def run_one_shot(self):
+        with self.get_manager() as manager:
+            self._schedule_one_shot_uploads()
+            manager.close()
+            manager.join()
+
+    def run_watcher(self):
+        with self.get_manager() as manager:
+            # Ensure the watcher is started before queueing the transfer of
+            # existing SSTables. Otherwise some tables could be missed if they
+            # are created after the initial transfers have started, but before
+            # the Watcher is seeing them.
+            with self.get_watcher():
+                logging.info('Watching SSTables')
+
+                self._schedule_one_shot_uploads()
+                manager.join()
 
 
-def check_includes_excludes(includes, excludes):
-    includes = frozenset(includes)
-    excludes = frozenset(excludes)
-
-    def check(value):
-        if includes and value not in includes:
-            return False
-
-        return value not in excludes
-
-    return check
+def positive_int(s):
+    i = int(s)
+    if i <= 0:
+        raise ValueError('Value `{}` is not a positive integer'.format(s))
+    return i
 
 
 def main():
@@ -119,83 +242,19 @@ def main():
              'new data')
     argp.add_argument(
         '--dry-run', default=False, action='store_true',
-        help="Don't upload or delete any files, only print intended actions ")
+        help="Don't upload or delete any files, only print intended actions")
+    argp.add_argument(
+        '--batch-size', default=1000, type=positive_int,
+        help="Number of SSTables to accumulate during traversal before "
+             "uploading. Raising this number be more network ")
+
     argp.add_argument(
         'data_dirs', nargs='+', metavar='data_dir',
         help='Path to one or more data directories to find backup files in')
 
     args = argp.parse_args()
-
-    if args.node_host_id and args.node_datacenter:
-        logger.info('Using provided host ID and DC')
-        host_id = args.node_host_id
-        datacenter = args.node_datacenter
-    elif not args.node_host_id and not args.node_datacenter:
-        logger.info('Determining host ID and DC using nodetool')
-
-        # Run nodetool earlier than necessary, since it's much quicker to fail than
-        # traversing the data dir to find the SSTables
-        nodetool_cmd = shlex.split(os.environ.get('NODETOOL_CMD', 'nodetool'))
-        node_info = get_node_info(nodetool_cmd)
-        host_id = node_info['ID']
-        datacenter = node_info['Data Center']
+    runner = Runner(args)
+    if args.one_shot:
+        runner.run_one_shot()
     else:
-        argp.error('Must provide both --node-host-id and --node-datacenter, '
-                   'or neither')
-        sys.exit(1)
-
-    logger.info('Host ID: %s, Datacenter: %s', host_id, datacenter)
-
-    keyspace_filter = check_includes_excludes(
-        args.keyspaces, args.excluded_keyspaces)
-    table_filter = check_includes_excludes(
-        args.tables, args.excluded_tables)
-
-    s3_client = boto3.client('s3')
-    s3_path = '{}/{}/{}'.format(clean_s3_path(args.s3_path), datacenter,
-                                host_id)
-
-    logger.info('Storing backups at s3://%s/%s', args.s3_bucket, s3_path)
-
-    s3_settings = {
-        'Metadata': args.s3_metadata,
-        'ACL': args.s3_acl,
-        'StorageClass': args.s3_storage_class
-    }
-
-    logger.debug('S3 settings: %s', s3_settings)
-
-    manager = TransferManager(
-        s3_client=s3_client, s3_bucket=args.s3_bucket, s3_path=s3_path,
-        s3_settings=s3_settings, delete=args.delete, dry_run=args.dry_run)
-
-    with manager:
-        logger.debug('Started TransferManager')
-
-        def schedule_one_shot():
-            sstables = []
-            for data_dir in args.data_dirs:
-                sstables.extend(traverse_data_dir(data_dir, keyspace_filter,
-                                                  table_filter))
-
-            logger.info(
-                'Starting initial SSTable sync (%d found)', len(sstables))
-            manager.schedule(sstables)
-
-        if args.one_shot:
-            schedule_one_shot()
-            manager.close()
-        else:
-            # Make sure to start the watcher before queueing the transfer of
-            # existing SSTables. Otherwise some tables could be missed if they
-            # are created after the initial transfers have started, but the
-            # Watcher is not running yet.
-            watcher = Watcher(
-                transfer_manager=manager, data_dirs=args.data_dirs,
-                keyspace_filter=keyspace_filter, table_filter=table_filter)
-            with watcher:
-                logging.info('Watching SSTables')
-                schedule_one_shot()
-
-                while True:
-                    time.sleep(1)
+        runner.run_watcher()
