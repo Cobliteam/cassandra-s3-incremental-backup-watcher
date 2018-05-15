@@ -102,8 +102,6 @@ class MultiSSTableGenerator(Thread):
             return list(self._sstables)
 
     def generate(self, count=1):
-        logger.warn('Generating SSTables')
-
         generated = []
         for gen in self._open_gens:
             sstables = gen.generate(count)
@@ -123,7 +121,6 @@ class MultiSSTableGenerator(Thread):
                 diff = next_run - now
                 if diff > 0:
                     time.sleep(diff / 2.0)
-                    logger.warn('Waiting %f', diff)
                 else:
                     next_run = now + self.interval
                     self.generate(self.sstables_per_round)

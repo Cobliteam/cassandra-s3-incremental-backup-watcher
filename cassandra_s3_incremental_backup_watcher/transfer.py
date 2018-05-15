@@ -70,8 +70,6 @@ class TransferManager(BaseSubscriber):
                 self._failed_transfers[sstable] = set()
 
     def _upload(self, sstable, src_path, dest_path):
-        logger.debug('start %s', dest_path)
-
         logger.debug('Sending: %s => %s', src_path, dest_path)
 
         transfer = self._s3_manager.upload(
@@ -81,7 +79,6 @@ class TransferManager(BaseSubscriber):
         return transfer
 
     def _check_finished(self):
-        logger.debug('_check_finished %s', self._pending_transfers)
         if self._closed and not self._pending_transfers:
             self._finished.set()
 
@@ -108,8 +105,6 @@ class TransferManager(BaseSubscriber):
             sys.stdout.write('Sent: {}\n'.format(dest_path))
 
         with self._state_lock:
-            logger.debug('done %s', dest_path)
-
             sstable_pending = self._pending_transfers[sstable]
             sstable_failed = self._failed_transfers[sstable]
 
@@ -123,9 +118,6 @@ class TransferManager(BaseSubscriber):
     def schedule(self, sstables):
         if self._closed:
             raise RuntimeError('Scheduling is closed')
-
-        for sstable in sstables:
-            logger.warn('Scheduling %s', sstable.storage_path())
 
         # Aggregate all the transfers that will be made to ensure a transfer
         # starting and ending quickly won't falsely trigger the finishing
