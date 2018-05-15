@@ -35,6 +35,7 @@ class TransferManager(BaseSubscriber):
         self.delete = delete
         self.dry_run = dry_run
 
+        self._s3_manager = None
         self._pending_transfers = {}
         self._failed_transfers = {}
         self._closed = False
@@ -127,6 +128,9 @@ class TransferManager(BaseSubscriber):
         if self._closed:
             raise RuntimeError('Scheduling is closed')
 
+        for sstable in sstables:
+            logger.warn('Scheduling %s', sstable.storage_path())
+
         # Aggregate all the transfers that will be made to ensure a transfer
         # starting and ending quickly won't falsely trigger the finishing
         # logic by seemingly being the only one.
@@ -189,16 +193,16 @@ class TransferManager(BaseSubscriber):
         self._closed = True
         self._check_finished()
 
-    def join(self):
-        while not self._finished.wait(10):
-            logger.debug('waiting %s', self._pending_transfers.values())
+    def join(self, timeout=None):
+        self._finished.wait(timeout=timeout)
 
     def shutdown(self, cancel=False):
-        self._closed = True
+        self.close()
 
-        if self._s3_manager:
-            self._s3_manager.shutdown(cancel=cancel)
-            self._s3_manager = None
+        # Call _shutdown directly until the following issue is fixed:
+        # https://github.com/boto/s3transfer/pull/105
+        self._s3_manager._shutdown(cancel=cancel, cancel_msg='')
+        self.join(10)
 
     def __enter__(self):
         self._s3_manager = S3TransferManager(self.s3_client,
@@ -206,5 +210,8 @@ class TransferManager(BaseSubscriber):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        cancel = exc_val is not None
-        self.shutdown(cancel=cancel)
+        try:
+            cancel = exc_val is not None
+            self.shutdown(cancel=cancel)
+        finally:
+            self._s3_manager = None
