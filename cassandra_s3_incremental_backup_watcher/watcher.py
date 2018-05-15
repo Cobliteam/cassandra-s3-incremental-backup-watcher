@@ -1,5 +1,6 @@
 import logging
 import re
+import sys
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -57,22 +58,29 @@ class Watcher(FileSystemEventHandler):
         if not event.is_directory:
             self._on_new_file(event.dest_path)
 
+    def shutdown(self):
+        self._observer.stop()
+        self.join(10)
+
+    def join(self, timeout=None):
+        self._observer.join(timeout=timeout)
+
     def __enter__(self):
         self._observer = Observer()
+        try:
+            for data_dir in self.data_dirs:
+                logger.debug('Watching directory: %s', data_dir)
+                self._observer.schedule(self, data_dir, recursive=True)
 
-        for data_dir in self.data_dirs:
-            logger.debug('Watching directory: %s', data_dir)
-            self._observer.schedule(self, data_dir, recursive=True)
-
-        logger.debug('Starting Observer')
-        self._observer.start()
-        return self
+            self._observer.start()
+            return self
+        except:
+            self.__exit__(*sys.exc_info())
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._observer:
-            try:
-                if exc_val:
-                    self._observer.stop()
-            finally:
-                self._observer.join(timeout=30)
-                self._observer = None
+        try:
+            if self._observer:
+                self.shutdown()
+        finally:
+            self._observer = None
