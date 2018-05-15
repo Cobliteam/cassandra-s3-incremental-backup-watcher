@@ -107,22 +107,18 @@ class TransferManager(BaseSubscriber):
         else:
             sys.stdout.write('Sent: {}\n'.format(dest_path))
 
-        try:
-            with self._state_lock:
-                logger.debug('done %s', dest_path)
+        with self._state_lock:
+            logger.debug('done %s', dest_path)
 
-                sstable_pending = self._pending_transfers[sstable]
-                sstable_failed = self._failed_transfers[sstable]
+            sstable_pending = self._pending_transfers[sstable]
+            sstable_failed = self._failed_transfers[sstable]
 
-                sstable_pending.remove(dest_path)
-                if exception is not None:
-                    sstable_failed.add(dest_path)
+            sstable_pending.remove(dest_path)
+            if exception is not None:
+                sstable_failed.add(dest_path)
 
-                if not sstable_pending:
-                    self._finish_sstable(sstable)
-        except:
-            logger.exception()
-            raise
+            if not sstable_pending:
+                self._finish_sstable(sstable)
 
     def schedule(self, sstables):
         if self._closed:

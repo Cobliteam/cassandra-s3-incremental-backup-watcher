@@ -54,9 +54,10 @@ class Runner(object):
         elif not args.node_host_id and not args.node_datacenter:
             logger.info('Determining host ID and DC using nodetool')
 
-            # Run nodetool earlier than necessary, since it's much quicker to fail than
-            # traversing the data dir to find the SSTables
-            nodetool_cmd = shlex.split(os.environ.get('NODETOOL_CMD', 'nodetool'))
+            # Run nodetool earlier than necessary, since it's much quicker to
+            # fail than traversing the data dir to find the SSTables
+            nodetool_cmd = os.environ.get('NODETOOL_CMD', 'nodetool')
+            nodetool_cmd = shlex.split(nodetool_cmd)
             node_info = self.get_node_info_from_nodetool(nodetool_cmd)
             host_id = node_info['ID']
             datacenter = node_info['Data Center']
@@ -203,7 +204,7 @@ class Runner(object):
         if watcher:
             try:
                 watcher.__exit__(exc_type, exc_val, exc_tb)
-            except:
+            except Exception:
                 logger.exception('Failed to clean up Watcher')
 
         manager.__exit__(exc_type, exc_val, exc_tb)

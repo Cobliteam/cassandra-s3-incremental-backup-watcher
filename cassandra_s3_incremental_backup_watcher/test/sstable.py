@@ -136,7 +136,7 @@ class MultiSSTableGenerator(Thread):
             while self._gens:
                 self._open_gens.append(
                     self._exit_stack.enter_context(self._gens.pop(0)))
-        except:
+        except Exception:
             self.__exit__(*sys.exc_info())
             raise
 

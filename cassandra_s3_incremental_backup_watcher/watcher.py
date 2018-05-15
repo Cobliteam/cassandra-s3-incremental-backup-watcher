@@ -74,7 +74,7 @@ class Watcher(FileSystemEventHandler):
 
             self._observer.start()
             return self
-        except:
+        except Exception:
             self.__exit__(*sys.exc_info())
             raise
 
