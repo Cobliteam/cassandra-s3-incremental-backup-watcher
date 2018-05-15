@@ -9,7 +9,6 @@ from threading import RLock, Thread
 
 import pytest
 from botocore.exceptions import ClientError
-from fallocate import fallocate
 
 from cassandra_s3_incremental_backup_watcher.sstable import SSTable, SSTableFile
 
@@ -54,7 +53,8 @@ class SSTableGenerator(object):
 
             with open(path, 'wb') as f:
                 if self.size != 0:
-                    fallocate(f, 0, self.size)
+                    f.seek(self.size - 1)
+                    f.write(b'\0')
 
             files.append(SSTableFile(filename=filename, size=self.size))
 
