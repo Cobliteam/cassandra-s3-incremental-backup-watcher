@@ -25,6 +25,8 @@ class Runner(object):
         self.parse_misc(args)
 
         self._s3_client = None
+        self._manager = None
+        self._watcher = None
 
     def get_node_info_from_nodetool(self, cmd):
         cmd = list(cmd) + ['info']
@@ -164,23 +166,47 @@ class Runner(object):
 
             schedule_batch()
 
-    def run_one_shot(self):
-        with self.get_manager() as manager:
-            self._schedule_one_shot_uploads(manager)
-            manager.close()
-            manager.join()
+    def start_one_shot(self):
+        self._schedule_one_shot_uploads(self._manager)
+        self._manager.close()
 
-    def run_watcher(self):
-        with self.get_manager() as manager:
-            # Ensure the watcher is started before queueing the transfer of
-            # existing SSTables. Otherwise some tables could be missed if they
-            # are created after the initial transfers have started, but before
-            # the Watcher is seeing them.
-            with self.get_watcher():
-                logging.info('Watching SSTables')
+    def start_watcher(self):
+        # Ensure the watcher is started before queueing the transfer of
+        # existing SSTables. Otherwise some tables could be missed if they
+        # are created after the initial transfers have started, but before
+        # the Watcher is seeing them.
+        self._watcher = self.get_watcher(self._manager).__enter__()
+        self._schedule_one_shot_uploads(self._manager)
 
-                self._schedule_one_shot_uploads(manager)
-                manager.join()
+    def stop_watcher(self):
+        self._watcher.shutdown()
+        self._manager.close()
+
+    def shutdown(self):
+        self.stop_watcher()
+        self._manager.shutdown()
+
+    def join(self, timeout=None):
+        if self._watcher:
+            self._watcher.join(timeout)
+        self._manager.join(timeout)
+
+    def __enter__(self):
+        self._manager = self.get_manager().__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        manager = self._manager
+        watcher = self._watcher
+        self._manager = self._watcher = None
+
+        if watcher:
+            try:
+                watcher.__exit__(exc_type, exc_val, exc_tb)
+            except:
+                logger.exception('Failed to clean up Watcher')
+
+        manager.__exit__(exc_type, exc_val, exc_tb)
 
 
 def positive_int(s):
