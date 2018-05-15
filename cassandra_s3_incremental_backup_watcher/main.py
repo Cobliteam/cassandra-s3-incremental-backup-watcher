@@ -154,14 +154,14 @@ class Runner(object):
         for data_dir in self.data_dirs:
             sstables = traverse_data_dir(data_dir, self.keyspace_filter,
                                          self.table_filter)
-            ks_table = None
+            qualified_table = None
             for sstable in sstables:
-                last_ks_table, ks_table,  = \
-                    ks_table, (sstable.keyspace, sstable.table)
-
-                if last_ks_table != ks_table or len(batch) == batch_size:
+                new_qualified_table = (sstable.keyspace, sstable.table)
+                if new_qualified_table != qualified_table \
+                        or len(batch) == batch_size:
                     schedule_batch()
 
+                qualified_table = new_qualified_table
                 batch.append(sstable)
 
             schedule_batch()
