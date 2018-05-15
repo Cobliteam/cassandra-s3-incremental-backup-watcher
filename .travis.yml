@@ -1,16 +1,25 @@
 dist: trusty
-sudo: false
 language: python
 matrix:
   include:
-    - python: "2.7"
     - python: "3.4"
     - python: "3.5"
     - python: "3.6"
     - python: pypy3.5-5.8.0
+
 cache:
   - pip
+  - directories:
+    - ~/.cache/minio
+
+before_install:
+  - >-
+    mkdir -p ~/.cache/minio &&
+    curl -o ~/.cache/minio/minio -z ~/.cache/minio/minio https://dl.minio.io/server/minio/release/linux-amd64/minio &&
+    install -m 755 ~/.cache/minio/minio ~/bin/minio
+
 install:
   - pip install tox-travis
+
 script:
   - tox
