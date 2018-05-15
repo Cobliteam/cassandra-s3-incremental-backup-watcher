@@ -292,8 +292,12 @@ def main():
         help='Path to one or more data directories to find backup files in')
 
     args = argp.parse_args()
-    runner = Runner(args)
-    if args.one_shot:
-        runner.run_one_shot()
-    else:
-        runner.run_watcher()
+    with Runner(args) as runner:
+        if args.one_shot:
+            runner.start_one_shot()
+        else:
+            try:
+                runner.start_watcher()
+            except KeyboardInterrupt:
+                runner.stop_watcher()
+                runner.join()
