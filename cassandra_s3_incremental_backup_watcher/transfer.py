@@ -82,14 +82,16 @@ class TransferManager(BaseSubscriber):
         if self._closed and not self._pending_transfers:
             self._finished.set()
 
-    def _finish_sstable(self, sstable):
+    def _finish_sstable(self, sstable, failed=False):
         logger.debug('Finished uploading SSTable: %s', sstable)
 
-        if self.delete and not self._failed_transfers[sstable]:
-            sstable.delete_files(dry_run=self.dry_run)
-
-        del self._pending_transfers[sstable]
-        self._check_finished()
+        try:
+            if self.delete and not failed:
+                sstable.delete_files(dry_run=self.dry_run)
+        finally:
+            with self._state_lock:
+                del self._pending_transfers[sstable]
+                self._check_finished()
 
     def _finish_upload(self, sstable, dest_path, exception=None,
                        cancelled=False):
@@ -112,8 +114,9 @@ class TransferManager(BaseSubscriber):
             if exception is not None:
                 sstable_failed.add(dest_path)
 
-            if not sstable_pending:
-                self._finish_sstable(sstable)
+        if not sstable_pending:
+            failed = bool(sstable_failed)
+            self._finish_sstable(sstable, failed=failed)
 
     def schedule(self, sstables):
         if self._closed:
